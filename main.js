@@ -23,10 +23,14 @@ import chokidar from 'chokidar'
 import { Conf } from 'electron-conf/main'
 
 import pkg from 'electron';
-const { app, BrowserWindow, dialog, screen, Menu, shell, globalShortcut, Tray, nativeImage, Notification } = pkg;
+const { app, ipcMain, BrowserWindow, dialog, Menu, shell, globalShortcut, Tray, nativeImage, Notification } = pkg;
 
 import { NeocitiesAPIClient } from 'async-neocities'
 import NekowebAPI from '@indiefellas/nekoweb-api'
+
+const BASE_NAME = 'bimbo'
+const CONFIG_FILENAME = BASE_NAME + '.yaml'
+const SECRETS_FILENAME = BASE_NAME + '-secrets.yaml'
 
 let tray
 const icon = nativeImage.createFromDataURL('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAABJElEQVR4AayRsWrCUBSGT24plCyVPkJL6dZ2cVfIWrv2bUzWPolrOwfi7qJOiujsqIsIwej9LrmXaEwQ9MKfnPOfcz5ObpRceW4LmH0GrcVHkMzfgxDZ5ap86m4DBp6+/OSx47d0oYvwkMok2e/lyJf8OEDj2+8+vN1Lo+OLjvOyGJBNCm98kyqerLj628h2msrqX78nKXatmKHBAAiQgehhQOSXyABeh3HfNl86bGcMgGHPEweRilO4m8i2OMDzKG7XQRi2F/wyjsMSAGPniSOTW9m/Qw4kG/wkxMhtQJJ/VwnCvSx/17SgSDV7bQJ0BMBgvUyJa8Dj0zazFC+6a/bc+tRKAEw20SBPx2wTcT94p8O6LmcBFJCGhIi4SrWAqqGifwAAAP//2exw9QAAAAZJREFUAwBmLW4hL61AdQAAAABJRU5ErkJggg==')
@@ -56,6 +60,8 @@ let rssFeed
 let server
 let watcher
 
+validateProjects()
+
 loadProject(conf.get('activeIndex'))
 
 let pagesToUpdate = {}
@@ -69,42 +75,18 @@ let showDebugMenu = false
 
 function createWindow () {
 	let opts = {
-		title: "bimbo", 
-		width: 320,
-		height: 350,
-		frame: false,
+		title: "generate API key - bimbo", 
+		width: 300,
+		height: 300,
 		alwaysOnTop: true,
-		transparent: true,
 		webPreferences: {
 			preload: path.join(__dirname, 'preload.js')
 		}
 	}
 
-	let display = screen.getPrimaryDisplay()
-	let width = display.bounds.width
-	let height = display.bounds.height
-
-	opts.x = width
-	opts.y = height
-
 	win = new BrowserWindow(opts)
-
-	win.webContents.on('context-menu', (_event, _params) => {
-		let menu = createMenu()
-
-		menu.popup()
-	})
 	
-	win.loadFile('index.html')
-
-	globalShortcut.register('CommandOrControl+Alt+W', () => {
-		const winPosition = win.getPosition()
-		win.setPosition(winPosition[0] - 100, winPosition[1] - 100)
-	})
-
-	// mainWindow.webContents.openDevTools({ mode: 'detach' })
-
-	// dialog.showMessageBox({message:startersPath})
+	win.loadFile('auth.html')
 }
 
 function createTray() {
@@ -148,8 +130,6 @@ function createMenu() {
 				})
 
 				if (!pickedPaths) { return }
-
-				console.log(pickedPaths)
 
 				let projects = conf.get('projects')
 				projects.push(path.dirname(pickedPaths[0]))
@@ -212,23 +192,7 @@ function createMenu() {
 			label: !!deployMeta ?
 				`🌐 deploy to ${deployMeta.provider}` : 'deployment not configured',
 			enabled: !!deployMeta,
-			click: function() {
-				let clickedId = dialog.showMessageBoxSync({
-					message: `are you sure you want to deploy ${projMeta.data.site.title} to ${deployMeta.provider}?`,
-					type: 'warning',
-					buttons: ['yeah!!', 'not yet...'],
-					defaultId: 1,
-					cancelId: 1,
-					title: 'confirm deployment'
-				})
-
-				if (clickedId == 0) {
-					deploy()
-				}
-				else {
-					console.log('deploy canceled')
-				}
-			}
+			click: requestDeploy,
 		},
 		{ type: 'separator' },
 		{ label: 'quit bimbo', click: function() {
@@ -244,12 +208,37 @@ app.whenReady().then(() => {
 
 	createTray()
 
+	ipcMain.handle('form', async function (_event, username, password) {
+		const apiKeyResponse = await NeocitiesAPIClient.getKey({
+			siteName: username,
+			ownerPassword: password
+		})
+
+		if (apiKeyResponse.result == 'success') {
+			const secretsPath = path.join(activeProjectMeta.rootPath, SECRETS_FILENAME) // TODO dedupe
+			if (!fs.existsSync(secretsPath)) {
+				fs.writeFileSync(secretsPath)
+			}
+
+			const secretsData = yaml.parse(fs.readFileSync(secretsPath, "utf-8"))
+			secretsData['deployment']['apiKey'] = apiKeyResponse.api_key
+			fs.writeFileSync(secretsPath, yaml.stringify(secretsData))
+			
+			loadProject(conf.get('activeIndex'))
+
+			requestDeploy()
+		}
+	})
+
 	globalShortcut.register('CommandOrControl+Alt+R', () => {
 		conf.clear()
 		loadProject(-1)
 		tray.setContextMenu(createMenu())
 		dialog.showMessageBox({ message: 'bimbo config has been reset to defaults' })
 	})
+
+	// having this listener active will prevent the app from quitting.
+	app.on('window-all-closed', () => {})
 
 	new Notification({
 		title: 'bimbo',
@@ -570,7 +559,17 @@ function generatePages(data) {
 
 		// compile html template
 		let htmlTemplate = Handlebars.compile(htmlOutput)
-		htmlOutput = htmlTemplate(page)
+
+		try {
+			htmlOutput = htmlTemplate(page)
+		}
+		catch(error) {
+			console.error(`failed to compile ${page.template}`)
+			let encodedError = error.message.replace(/[\u00A0-\u9999<>\&]/gim, function(i) {
+				return '&#' + i.charCodeAt(0) + ';'
+			})
+			htmlOutput = ('<pre>' + encodedError + '</pre>')
+		}
 
 		let outputPath = page.url
 		let outputDir = path.dirname(outputPath)
@@ -598,9 +597,13 @@ async function watch() {
 			return paths.build == filePath || ['.git', '.gitignore', '.DS_Store'].includes(path.basename(filePath))
 		},
 		ignoreInitial: true
-	}).on('all', (event, path) => {
-		console.log(event, path)
+	}).on('all', (event, changedPath) => {
+		console.log(event, changedPath)
 		build()
+
+		if ([CONFIG_FILENAME, SECRETS_FILENAME].includes(path.basename(changedPath))) {
+			loadProject(conf.get('activeIndex'))
+		}
 	})
 
 	if (server) {
@@ -645,13 +648,13 @@ async function loadProject(index) {
 	}
 
 	projectsMeta = conf.get('projects').map((projRootPath) => {
-		const secretsPath = path.join(projRootPath, 'bimbo-secrets.yaml')
+		const secretsPath = path.join(projRootPath, SECRETS_FILENAME)
 
 		const projSecrets = fs.existsSync(secretsPath) ? yaml.parse(
 			fs.readFileSync(secretsPath, "utf-8")
 		) : {}
 		let projData = yaml.parse(
-			fs.readFileSync(path.join(projRootPath, 'bimbo.yaml'), "utf-8")
+			fs.readFileSync(path.join(projRootPath, CONFIG_FILENAME), "utf-8")
 		)
 
 		return {
@@ -689,8 +692,50 @@ async function loadProject(index) {
 	}
 }
 
+function projectExists(projRootPath) {
+	const configFilepath = path.join(projRootPath, CONFIG_FILENAME)
+
+	return fs.existsSync(configFilepath)
+}
+
+function validateProjects() {
+	const projects = conf.get('projects').filter((projRootPath) => {
+		projectExists(projRootPath)
+	})
+
+	conf.set('projects', projects)
+
+	if (projects.length == 0) {
+		conf.set('activeIndex', -1)
+	}
+}
+
+function requestDeploy() {
+	const deployMeta = activeProjectMeta.data.deployment
+
+	if (deployMeta.provider == 'neocities' && !deployMeta.apiKey) {
+		createWindow()
+	}
+	else {
+		let clickedId = dialog.showMessageBoxSync({
+			message: `are you sure you want to deploy ${activeProjectMeta.data.site.title} to ${deployMeta.provider}?`,
+			type: 'warning',
+			buttons: ['yeah!!', 'not yet...'],
+			defaultId: 1,
+			cancelId: 1,
+			title: 'confirm deployment'
+		})
+
+		if (clickedId == 0) {
+			deploy()
+		}
+		else {
+			console.log('deploy canceled')
+		}
+	}
+}
+
 function deploy() {
-	console.log(activeProjectMeta)
 	switch (activeProjectMeta.data.deployment.provider) {
 		case 'nekoweb':
 			deployToNekoweb()
@@ -720,8 +765,6 @@ async function deployToNekoweb() {
 	let nekoweb = new NekowebAPI({
 		apiKey: activeProjectConfig.data.deployment.apiKey,
 	})
-
-	console.log(activeProjectConfig.data.deployment)
 
 	let response = await nekoweb.getSiteInfo('windfuck.ing')
 	console.log(response)
