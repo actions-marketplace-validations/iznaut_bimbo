@@ -16,11 +16,9 @@ import { sendBlueskyPostWithEmbed } from './bluesky.ts'
 import { createServer } from 'vite'
 import chokidar from 'chokidar'
 
-import { conf, log } from './utils.js'
+import { conf, logger } from './utils.js'
 import projects from './projects.js'
-
 import config from './config.js'
-
 
 let rssFeed
 
@@ -156,8 +154,8 @@ async function build() {
 					page.md.replace('bskyPostId: tbd', `bskyPostId: ${postsData[index].id}`)
 				)
 	
-				log('Successfully posted to Bluesky!')
-				log(`https://bsky.app/profile/${postsData[index].handle}/post/${postsData[index].id}`)
+				logger.info('Successfully posted to Bluesky!')
+				logger.info(`https://bsky.app/profile/${postsData[index].handle}/post/${postsData[index].id}`)
 	
 				index++
 			})
@@ -196,7 +194,7 @@ async function build() {
 	}
 
 	// copy static pages
-	fs.cp(getJoinedPath(PATHS.STATIC), getJoinedPath(PATHS.OUTPUT), { recursive: true }, (err) => { if (err) { console.log(err) } })
+	fs.cp(getJoinedPath(PATHS.STATIC), getJoinedPath(PATHS.OUTPUT), { recursive: true }, (err) => { if (err) { logger.info(err) } })
 
 	fs.writeFileSync(
 		path.join(getJoinedPath(PATHS.OUTPUT), 'feed.xml'),
@@ -215,13 +213,13 @@ async function build() {
 		}
 	}
 	catch (err) {
-		log('no Bluesky User ID set, skipping integrations...')
-		console.log(err)
+		logger.info('no Bluesky User ID set, skipping integrations...')
+		logger.info(err)
 	}
 
 	process.watchData = data
 
-	log("site build completed 💅")
+	logger.debug("site build completed 💅")
 }
 
 export async function watch() {
@@ -229,38 +227,46 @@ export async function watch() {
 		await watcher.close()
 	}
 
-	watcher = chokidar.watch(projects.getActive().rootPath, {
-		ignored: (filePath) => {
-			return getJoinedPath(PATHS.OUTPUT) == path.normalize(filePath) || ['.git', '.gitignore', '.DS_Store'].includes(path.basename(filePath))
-		},
-		ignoreInitial: true
-	}).on('all', (event, changedPath) => {
-		console.log(event, changedPath)
+	let activeProject = projects.getActive()
+
+	if (activeProject) {
+		watcher = chokidar.watch(activeProject.rootPath, {
+			ignored: (filePath) => {
+				return (
+					getJoinedPath(PATHS.OUTPUT) == path.normalize(filePath)
+					|| ['.git', '.gitignore', '.DS_Store'].includes(path.basename(filePath))
+					|| filePath.includes('.vscode/settings.json') // TODO read this (and .gitignore) from config const
+				)
+			},
+			ignoreInitial: true
+		}).on('all', (event, changedPath) => {
+			logger.info(`${event}: ${changedPath}`)
+			build()
+	
+			if ([config.CONFIG_FILENAME, config.SECRETS_FILENAME].includes(path.basename(changedPath))) {
+				projects.setActive()
+			}
+		})
+	
+		if (server) {
+			server.close()
+		}
+	
+		server = await createServer({
+			configFile: false,
+			root: getJoinedPath(PATHS.OUTPUT),
+			publicDir: false,
+			logLevel: 'silent',
+			server: {
+				port: 6969,
+				strictPort: true
+			}
+		})
+		await server.listen()
+		logger.info(`monitoring ${activeProject.rootPath} for changes`)
+	
 		build()
-
-		if ([config.CONFIG_FILENAME, config.SECRETS_FILENAME].includes(path.basename(changedPath))) {
-			loadProject(conf.get('activeIndex'))
-		}
-	})
-
-	if (server) {
-		server.close()
 	}
-
-	server = await createServer({
-		configFile: false,
-		root: getJoinedPath(PATHS.OUTPUT),
-		publicDir: false,
-		logLevel: 'silent',
-		server: {
-			port: 6969,
-			strictPort: true
-		}
-	})
-	await server.listen()
-	log(`monitoring ${projects.getActive().rootPath} for changes`)
-
-	build()
 }
 
 function getContentDefaults(dir) {
@@ -305,7 +311,7 @@ function updateMetadata(filepath, data) {
 	}
 
 	if (page.draft) {
-		log(`skipping ${filepath} (draft)`)
+		logger.info(`skipping ${filepath} (draft)`)
 		return data
 	}
 

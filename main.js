@@ -4,14 +4,17 @@ import * as path from 'node:path'
 import { exec } from 'node:child_process'
 import _ from 'lodash'
 import { fileURLToPath } from 'url'
+import prompt from 'electron-prompt'
+import * as yaml from 'yaml'
+import winston from 'winston'
 
-import { conf, isDev } from './utils.js'
+import { conf, isDev, logger } from './utils.js'
+import config from './config.js'
 import projects from './projects.js'
 import { deploy } from './deploy.js'
 
 import {
 	app,
-	BrowserWindow,
 	dialog,
 	Menu,
 	shell,
@@ -29,13 +32,31 @@ const startersPath = path.join((isDev() ? '' : process.resourcesPath), 'project-
 
 const localUrl = 'http://localhost:6969'
 
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = path.dirname(__filename)
-
 let showDebugMenu = false
 
 app.whenReady().then(() => {
+	function getAppRoot() {
+		if (isDev()) {
+			return './'
+		}
+
+		if ( process.platform === 'win32' ) {
+			return path.join( app.getAppPath(), '/../../../' );
+		}  else {
+			return path.join( app.getAppPath(), '/../../../../' );
+		}
+	}
+
+	logger.add(new winston.transports.File({
+		filename: path.join(getAppRoot(), 'bimbo.log'),
+		handleRejections: true,
+		humanReadableUnhandledException: true
+	}))
+
+	logger.info('app ready!')
+
 	if (platform() === "darwin") {
+		logger.info('macos platform, hiding dock icon')
 		app.dock.hide()
 	}
 
@@ -46,10 +67,12 @@ app.whenReady().then(() => {
 	tray.setTitle('bimbo beta')
 
 	globalShortcut.register('CommandOrControl+Alt+R', () => {
+		logger.info('attempting config clear')
 		conf.clear()
 		projects.setActive(-1)
 		updateTrayMenu()
 		dialog.showMessageBox({ message: 'bimbo config has been reset to defaults' })
+		logger.info('config cleared')
 	})
 
 	// having this listener active will prevent the app from quitting.
@@ -62,22 +85,6 @@ app.whenReady().then(() => {
 		shell.openExternal('https://bimbo.nekoweb.org/posts/2-getting-started.html')
 	}
 })
-
-function createWindow() {
-	let opts = {
-		title: "generate API key - bimbo", 
-		width: 300,
-		height: 300,
-		alwaysOnTop: true,
-		webPreferences: {
-			preload: path.join(__dirname, 'preload.js')
-		}
-	}
-
-	win = new BrowserWindow(opts)
-	
-	win.loadFile('auth.html')
-}
 
 function updateTrayMenu() {
 	let menu = null
@@ -93,14 +100,38 @@ function updateTrayMenu() {
 					.map((dirent) => {
 						return {
 							label: dirent.name,
-							click: function () {
+							click: async function () {
+								const title = await prompt({
+									title: 'create new bimbo project',
+									buttonLabels: {
+										ok: 'let\'s go',
+										cancel: 'nevermind'
+									},
+									label: 'title:',
+									value: dirent.name,
+									type: 'input'
+								})
+								// .then((r) => {
+								// 	if(r === null) {
+								// 		console.logger.info('user cancelled');
+								// 	} else {
+								// 		console.logger.info('result', r);
+								// 	}
+								// })
+								.catch(console.error);
+
+								if (!title) { return }
+
 								let pickedPaths = dialog.showOpenDialogSync({
 									properties: ['openDirectory']
 								})
 
 								if (!pickedPaths) { return }
 
-								initProjectStarter(pickedPaths[0], dirent.name)
+								initProjectStarter(
+									path.join(pickedPaths[0], title),
+									dirent.name
+								)
 							}
 					}
 				})
@@ -186,10 +217,26 @@ function updateTrayMenu() {
 	tray.setContextMenu(menu)
 }
 
-async function initProjectStarter(copyPath, starterName) {
-	const newProjPath = path.join(copyPath, starterName)
+async function initProjectStarter(newProjPath, starterName) {
 	fs.cpSync(path.join(startersPath, starterName), newProjPath, {recursive: true})
-	fs.cpSync(path.join(startersPath, '.gitignore'), path.join(newProjPath, '.gitignore'))
+
+	_.each(config.EXTRA_INIT_FILES, (data) => {
+		if (data.json) {
+			data.text = JSON.stringify(data.json, null, true)
+		}
+
+		if (data.filePath.includes('.vscode')) {
+			fs.mkdirSync(path.join(newProjPath, '.vscode'))
+		}
+
+		fs.writeFileSync(path.join(newProjPath, data.filePath), data.text)
+	})
+
+	let configFilepath = path.join(newProjPath, config.CONFIG_FILENAME)
+
+	let newConfig = yaml.parse(fs.readFileSync(configFilepath, 'utf-8'))
+	newConfig.site.title = path.basename(newProjPath)
+	fs.writeFileSync(configFilepath, yaml.stringify(newConfig))
 
 	projects.add(newProjPath)
 	projects.setActive(projects.getAll().length - 1)
